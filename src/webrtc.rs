@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -569,6 +569,22 @@ impl WebRTCStream {
             .ok_or_else(|| anyhow::anyhow!("WebRTC setup handoff was empty"))
     }
 
+    /// The IPv6 address the OS picks as the source of a new outgoing connection, or `None`
+    /// without an IPv6 route. A UDP `connect` only runs source selection; nothing is sent.
+    fn preferred_ipv6_source() -> Option<Ipv6Addr> {
+        let socket = std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).ok()?;
+        socket.connect(("2001:4860:4860::8888", 53)).ok()?;
+        match socket.local_addr().ok()?.ip() {
+            IpAddr::V6(v6) => Some(v6),
+            IpAddr::V4(_) => None,
+        }
+    }
+
+    #[inline]
+    fn ipv6_candidate_allowed(v6: Ipv6Addr, preferred: Option<Ipv6Addr>) -> bool {
+        preferred == Some(v6)
+    }
+
     async fn new_inner(
         remote_endpoint: String,
         force_relay: bool,
@@ -617,11 +633,16 @@ impl WebRTCStream {
         let mut s = SettingEngine::default();
         s.detach_data_channels();
         s.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
-        // fe80::/10 can only be bound together with a scope id, which `IpAddr` cannot carry, so
-        // gathering one never yields a candidate - only a failed bind and a warning per address.
-        // Spelled out because `is_unicast_link_local` is not stable on our MSRV.
-        s.set_ip_filter(Box::new(|ip: IpAddr| match ip {
-            IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 != 0xfe80,
+        // Of a machine's IPv6 addresses, gather only the one the OS itself sends from. An
+        // interface also carries stable addresses, often derived from the MAC, that the OS never
+        // picks as a source while privacy extensions rotate the temporary one; a candidate for
+        // one of those hands the peer an identifier that outlives every rotation, which nothing
+        // else this machine sends out ever shows. The preferred address is what every outgoing
+        // connection already discloses. This also drops fe80::/10, which can only be bound with
+        // a scope id `IpAddr` cannot carry, so gathering one never yielded a candidate anyway.
+        let preferred_v6 = Self::preferred_ipv6_source();
+        s.set_ip_filter(Box::new(move |ip: IpAddr| match ip {
+            IpAddr::V6(v6) => Self::ipv6_candidate_allowed(v6, preferred_v6),
             IpAddr::V4(_) => true,
         }));
 
@@ -2747,5 +2768,31 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         timeout(Duration::from_secs(40), connect)
             .await
             .expect("concurrent WebRTC sends did not complete in time");
+    }
+
+    #[test]
+    fn test_ipv6_candidates_are_only_the_preferred_source() {
+        use std::net::Ipv6Addr;
+        let preferred: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let stable: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let link_local: Ipv6Addr = "fe80::1".parse().unwrap();
+        let ula: Ipv6Addr = "fd00::1".parse().unwrap();
+        let allowed = |v6, p| super::WebRTCStream::ipv6_candidate_allowed(v6, p);
+        assert!(allowed(preferred, Some(preferred)));
+        assert!(!allowed(stable, Some(preferred)));
+        assert!(!allowed(link_local, Some(preferred)));
+        assert!(!allowed(ula, Some(preferred)));
+        // No IPv6 route: nothing to pair over, and nothing to disclose.
+        assert!(!allowed(preferred, None));
+    }
+
+    #[test]
+    fn test_preferred_ipv6_source_is_a_usable_global_address_or_none() {
+        // Environment dependent by nature: only the shape of the answer is asserted.
+        if let Some(v6) = super::WebRTCStream::preferred_ipv6_source() {
+            assert!(!v6.is_loopback());
+            assert!(!v6.is_unspecified());
+            assert_ne!(v6.segments()[0] & 0xffc0, 0xfe80);
+        }
     }
 }
