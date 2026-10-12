@@ -1,0 +1,32 @@
+name: modul4r sync
+
+# Keeps the modul4r branch current with upstream: rebase our small patch
+# (default server + key) onto upstream/main and force-push. A conflict fails
+# the run loudly. The rustdesk fork's sync job runs 17 minutes later and
+# picks up the new head.
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"  # Mondays 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: modul4r
+          fetch-depth: 0
+
+      - name: Rebase the patch onto upstream
+        run: |
+          git config user.name "modul4r-sync"
+          git config user.email "marcello@modul4r.com"
+          git remote add upstream https://github.com/rustdesk/hbb_common.git
+          git fetch upstream main
+          git rebase upstream/main || { echo "::error::hbb_common patch conflict — rebase modul4r by hand"; exit 1; }
+          git push -f origin modul4r
